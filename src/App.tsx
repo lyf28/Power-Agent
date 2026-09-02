@@ -9,6 +9,10 @@ interface BatteryStatus {
   remaining_seconds: number | null;
 }
 
+interface DisplayInfo {
+  refresh_rate: number;
+}
+
 function formatRemainingTime(seconds: number | null) {
   if (seconds === null) {
     return "Unavailable";
@@ -22,6 +26,7 @@ function formatRemainingTime(seconds: number | null) {
 
 function App() {
   const [battery, setBattery] = useState<BatteryStatus | null>(null);
+  const [display, setDisplay] = useState<DisplayInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function loadBatteryStatus() {
@@ -38,11 +43,29 @@ function App() {
     }
   }
 
+  async function loadDisplayInfo() {
+  try {
+    const result =
+      await invoke<DisplayInfo>("get_display_info");
+
+    console.log("Display info:", result);
+
+    setDisplay(result);
+  } catch (err) {
+    console.error(
+      "Failed to get display info:",
+      err
+    );
+  }
+}
+
   useEffect(() => {
     loadBatteryStatus();
+    loadDisplayInfo();
 
     const interval = setInterval(() => {
       loadBatteryStatus();
+      loadDisplayInfo();
     }, 5000);
 
     return () => {
@@ -77,6 +100,12 @@ function App() {
             {formatRemainingTime(battery.remaining_seconds)}
           </p>
         </div>
+      )}
+
+      {display && (
+        <p>
+          Refresh Rate: {display.refresh_rate} Hz
+        </p>
       )}
     </main>
   );

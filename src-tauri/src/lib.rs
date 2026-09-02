@@ -6,12 +6,24 @@ use windows::Win32::System::Power::{
     SYSTEM_POWER_STATUS,
 };
 
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplaySettingsW,
+    DEVMODEW,
+    ENUM_CURRENT_SETTINGS,
+};
+
 #[derive(Serialize)]
 struct BatteryStatus {
     percentage: u8,
     plugged_in: bool,
     charging: bool,
     remaining_seconds: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct DisplayInfo {
+    refresh_rate: u32,
 }
 
 #[tauri::command]
@@ -44,11 +56,37 @@ fn get_battery_status() -> Result<BatteryStatus, String> {
     }
 }
 
+#[tauri::command]
+fn get_display_info() -> Result<DisplayInfo, String> {
+    unsafe {
+        let mut dev_mode = DEVMODEW::default();
+
+        dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+
+        let result = EnumDisplaySettingsW(
+            None,
+            ENUM_CURRENT_SETTINGS,
+            &mut dev_mode,
+        );
+
+        if !result.as_bool() {
+            return Err(
+                "Failed to get current display settings".to_string()
+            );
+        }
+
+        Ok(DisplayInfo {
+            refresh_rate: dev_mode.dmDisplayFrequency,
+        })
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            get_battery_status
+            get_battery_status,
+            get_display_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
