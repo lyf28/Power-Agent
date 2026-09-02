@@ -1,49 +1,83 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+interface BatteryStatus {
+  percentage: number;
+  plugged_in: boolean;
+  charging: boolean;
+  remaining_seconds: number | null;
+}
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+function formatRemainingTime(seconds: number | null) {
+  if (seconds === null) {
+    return "Unavailable";
   }
 
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+
+  return `${hours}h ${minutes}m`;
+}
+
+function App() {
+  const [battery, setBattery] = useState<BatteryStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function loadBatteryStatus() {
+    try {
+      const result = await invoke<BatteryStatus>("get_battery_status");
+
+      console.log("Battery status:", result);
+
+      setBattery(result);
+      setError(null);
+    } catch (err) {
+      console.error("Failed to get battery status:", err);
+      setError(String(err));
+    }
+  }
+
+  useEffect(() => {
+    loadBatteryStatus();
+
+    const interval = setInterval(() => {
+      loadBatteryStatus();
+    }, 5000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
+
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <main>
+      <h1>Power Agent</h1>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      <h2>System Status</h2>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      {error && <p>Error: {error}</p>}
+
+      {!battery && !error && <p>Loading...</p>}
+
+      {battery && (
+        <div>
+          <p>Battery: {battery.percentage}%</p>
+
+          <p>
+            Power Source: {battery.plugged_in ? "AC" : "Battery"}
+          </p>
+
+          <p>
+            Charging: {battery.charging ? "Yes" : "No"}
+          </p>
+
+          <p>
+            Remaining Time:{" "}
+            {formatRemainingTime(battery.remaining_seconds)}
+          </p>
+        </div>
+      )}
     </main>
   );
 }
