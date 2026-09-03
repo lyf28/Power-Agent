@@ -29,12 +29,15 @@ use windows::Win32::System::Power::{
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW, EnumDisplaySettingsExW, DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE,
-    DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID, DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID,
-    DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID,
-    DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE, DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID,
-    DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE, DM_BITSPERPEL, DM_DISPLAYFIXEDOUTPUT,
-    DM_DISPLAYFLAGS, DM_DISPLAYFREQUENCY, DM_DISPLAYORIENTATION, DM_PELSHEIGHT, DM_PELSWIDTH,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsExW, CDS_TEST, DEVMODEW,
+    DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID,
+    DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID, DISPLAYCONFIG_PATH_MODE_IDX_INVALID,
+    DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID, DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE,
+    DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
+    DISP_CHANGE, DISP_CHANGE_BADDUALVIEW, DISP_CHANGE_BADFLAGS, DISP_CHANGE_BADMODE,
+    DISP_CHANGE_BADPARAM, DISP_CHANGE_FAILED, DISP_CHANGE_NOTUPDATED, DISP_CHANGE_RESTART,
+    DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFIXEDOUTPUT, DM_DISPLAYFLAGS,
+    DM_DISPLAYFREQUENCY, DM_DISPLAYORIENTATION, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION,
     ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
@@ -46,7 +49,7 @@ struct BatteryStatus {
     remaining_seconds: Option<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct DisplayMode {
     width: u32,
     height: u32,
@@ -56,6 +59,88 @@ struct DisplayMode {
     orientation: Option<u32>,
     fixed_output: Option<u32>,
     field_flags: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct GdiEnumeratedCandidate {
+    enumeration_index: u32,
+    mode: DisplayMode,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GdiCandidatePreflightStatus {
+    Accepted,
+    Rejected,
+    UnavailableOrError,
+    Ambiguous,
+    NotFound,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GdiPreflightEvidenceLevel {
+    GdiDriverPreflight,
+}
+
+#[derive(Serialize)]
+struct GdiCurrentModeSanityCheck {
+    current_mode: DisplayMode,
+    passed: bool,
+    windows_result_code: Option<i32>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GdiCandidatePreflight {
+    requested_refresh_rate: u32,
+    status: GdiCandidatePreflightStatus,
+    windows_result_code: Option<i32>,
+    display_device_name: Option<String>,
+    matched_candidate_count: u32,
+    candidate: Option<GdiEnumeratedCandidate>,
+    matched_candidates: Vec<GdiEnumeratedCandidate>,
+    current_mode_sanity_check: Option<GdiCurrentModeSanityCheck>,
+    evidence_level: GdiPreflightEvidenceLevel,
+    error: Option<String>,
+}
+
+impl GdiCandidatePreflight {
+    fn new(requested_refresh_rate: u32) -> Self {
+        Self {
+            requested_refresh_rate,
+            status: GdiCandidatePreflightStatus::UnavailableOrError,
+            windows_result_code: None,
+            display_device_name: None,
+            matched_candidate_count: 0,
+            candidate: None,
+            matched_candidates: Vec::new(),
+            current_mode_sanity_check: None,
+            evidence_level: GdiPreflightEvidenceLevel::GdiDriverPreflight,
+            error: None,
+        }
+    }
+
+    fn unavailable(mut self, windows_result_code: Option<i32>, error: String) -> Self {
+        self.status = GdiCandidatePreflightStatus::UnavailableOrError;
+        self.windows_result_code = windows_result_code;
+        self.error = Some(error);
+        self
+    }
+
+    fn set_matched_candidates(&mut self, candidates: Vec<GdiEnumeratedCandidate>) {
+        self.matched_candidate_count = candidates.len() as u32;
+        self.candidate = (candidates.len() == 1)
+            .then(|| candidates.first().cloned())
+            .flatten();
+        self.matched_candidates = candidates;
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct NativeGdiCandidate {
+    enumeration_index: u32,
+    dev_mode: DEVMODEW,
 }
 
 #[derive(Serialize)]
@@ -272,15 +357,158 @@ fn validate_current_ccd_configuration() -> CurrentCcdConfigurationValidation {
 }
 
 #[tauri::command]
+fn preflight_gdi_refresh_rate_candidate(requested_refresh_rate: u32) -> GdiCandidatePreflight {
+    unsafe { preflight_gdi_refresh_rate_candidate_impl(requested_refresh_rate) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn preflight_gdi_refresh_rate_candidate_impl(
+    requested_refresh_rate: u32,
+) -> GdiCandidatePreflight {
+    let mut preflight = GdiCandidatePreflight::new(requested_refresh_rate);
+
+    if requested_refresh_rate <= 1 {
+        return preflight.unavailable(
+            None,
+            "Requested refresh rate must be greater than 1 Hz".to_string(),
+        );
+    }
+
+    let primary_device_name = match get_primary_display_device_name() {
+        Ok(device_name) => device_name,
+        Err(error) => return preflight.unavailable(None, error),
+    };
+    preflight.display_device_name = Some(null_terminated_utf16_to_string(&primary_device_name));
+    let device_name = PCWSTR(primary_device_name.as_ptr());
+    let current_native_mode = match get_current_native_gdi_mode(device_name) {
+        Ok(mode) => mode,
+        Err(error) => return preflight.unavailable(None, error),
+    };
+    let current_mode = match display_mode_from_dev_mode(&current_native_mode) {
+        Ok(mode) => mode,
+        Err(error) => return preflight.unavailable(None, error),
+    };
+    let native_candidates = match enumerate_matching_native_gdi_candidates(
+        device_name,
+        &current_native_mode,
+        requested_refresh_rate,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => return preflight.unavailable(None, error),
+    };
+    let matched_candidates = match summarize_native_gdi_candidates(&native_candidates) {
+        Ok(candidates) => candidates,
+        Err(error) => return preflight.unavailable(None, error),
+    };
+    preflight.set_matched_candidates(matched_candidates);
+
+    let current_sanity_candidates = match enumerate_matching_native_gdi_candidates(
+        device_name,
+        &current_native_mode,
+        current_native_mode.dmDisplayFrequency,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            preflight.current_mode_sanity_check = Some(GdiCurrentModeSanityCheck {
+                current_mode,
+                passed: false,
+                windows_result_code: None,
+                error: Some(error.clone()),
+            });
+            return preflight.unavailable(None, error);
+        }
+    };
+
+    if current_sanity_candidates.len() != 1 {
+        let error = format!(
+            "Expected exactly one enumerated native mode matching the current {} Hz configuration, but found {}; current-mode sanity was not attempted",
+            current_native_mode.dmDisplayFrequency,
+            current_sanity_candidates.len(),
+        );
+        preflight.current_mode_sanity_check = Some(GdiCurrentModeSanityCheck {
+            current_mode,
+            passed: false,
+            windows_result_code: None,
+            error: Some(error.clone()),
+        });
+        return preflight.unavailable(None, error);
+    }
+
+    let sanity_result = ChangeDisplaySettingsExW(
+        device_name,
+        Some(&raw const current_sanity_candidates[0].dev_mode),
+        None,
+        CDS_TEST,
+        None,
+    );
+    let sanity_passed = sanity_result == DISP_CHANGE_SUCCESSFUL;
+    preflight.current_mode_sanity_check = Some(GdiCurrentModeSanityCheck {
+        current_mode,
+        passed: sanity_passed,
+        windows_result_code: Some(sanity_result.0),
+        error: (!sanity_passed).then(|| {
+            format!(
+                "Current-mode CDS_TEST sanity check returned {} ({})",
+                sanity_result.0,
+                display_change_result_name(sanity_result),
+            )
+        }),
+    });
+
+    if !sanity_passed {
+        return preflight.unavailable(
+            Some(sanity_result.0),
+            "The current display mode did not pass CDS_TEST; the validation environment or implementation is unsuitable, so the requested candidate was not classified"
+                .to_string(),
+        );
+    }
+
+    if native_candidates.is_empty() {
+        preflight.status = GdiCandidatePreflightStatus::NotFound;
+        preflight.error = Some(format!(
+            "No refresh-only {requested_refresh_rate} Hz mode was reported for the primary display at the current resolution"
+        ));
+        return preflight;
+    }
+
+    if native_candidates.len() > 1 {
+        preflight.status = GdiCandidatePreflightStatus::Ambiguous;
+        preflight.error = Some(format!(
+            "Multiple enumerated native modes matched the {requested_refresh_rate} Hz request; no candidate was selected"
+        ));
+        return preflight;
+    }
+
+    let candidate_result = ChangeDisplaySettingsExW(
+        device_name,
+        Some(&raw const native_candidates[0].dev_mode),
+        None,
+        CDS_TEST,
+        None,
+    );
+    preflight.status = classify_candidate_display_change_result(candidate_result);
+    preflight.windows_result_code = Some(candidate_result.0);
+    preflight.error = (preflight.status != GdiCandidatePreflightStatus::Accepted).then(|| {
+        format!(
+            "Candidate CDS_TEST returned {} ({})",
+            candidate_result.0,
+            display_change_result_name(candidate_result),
+        )
+    });
+    preflight
+}
+
+#[tauri::command]
 fn get_display_info() -> Result<DisplayInfo, String> {
     unsafe {
         let primary_device_name = get_primary_display_device_name()?;
         let display_device_name =
             null_terminated_utf16_to_string(&primary_device_name);
         let device_name = PCWSTR(primary_device_name.as_ptr());
-        let mut current_mode = DEVMODEW::default();
-
-        current_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let mut current_mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
 
         let result = EnumDisplaySettingsExW(
             device_name,
@@ -307,9 +535,10 @@ fn get_display_info() -> Result<DisplayInfo, String> {
         let mut mode_index = 0;
 
         loop {
-            let mut candidate_mode = DEVMODEW::default();
-            candidate_mode.dmSize =
-                std::mem::size_of::<DEVMODEW>() as u16;
+            let mut candidate_mode = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
 
             let result = EnumDisplaySettingsExW(
                 device_name,
@@ -355,6 +584,207 @@ fn get_display_info() -> Result<DisplayInfo, String> {
             driver_reported_mode_candidates,
             ccd_mapping,
         })
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn get_current_native_gdi_mode(device_name: PCWSTR) -> Result<DEVMODEW, String> {
+    let mut current_mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+
+    let result = EnumDisplaySettingsExW(
+        device_name,
+        ENUM_CURRENT_SETTINGS,
+        &mut current_mode,
+        ENUM_DISPLAY_SETTINGS_FLAGS::default(),
+    );
+
+    if !result.as_bool() {
+        return Err("Failed to get current GDI display settings for preflight".to_string());
+    }
+
+    ensure_self_contained_native_dev_mode(&current_mode, "current GDI mode")?;
+
+    if current_mode.dmDisplayFrequency <= 1 {
+        return Err("Windows did not report a concrete current refresh rate".to_string());
+    }
+
+    Ok(current_mode)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn enumerate_matching_native_gdi_candidates(
+    device_name: PCWSTR,
+    current_mode: &DEVMODEW,
+    requested_refresh_rate: u32,
+) -> Result<Vec<NativeGdiCandidate>, String> {
+    let mut matching_candidates = Vec::new();
+    let mut mode_index = 0_u32;
+
+    loop {
+        let mut candidate_mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+
+        let result = EnumDisplaySettingsExW(
+            device_name,
+            ENUM_DISPLAY_SETTINGS_MODE(mode_index),
+            &mut candidate_mode,
+            ENUM_DISPLAY_SETTINGS_FLAGS::default(),
+        );
+
+        if !result.as_bool() {
+            break;
+        }
+
+        if gdi_mode_matches_refresh_only_request(
+            current_mode,
+            &candidate_mode,
+            requested_refresh_rate,
+        ) {
+            ensure_self_contained_native_dev_mode(&candidate_mode, "enumerated GDI candidate")?;
+            matching_candidates.push(NativeGdiCandidate {
+                enumeration_index: mode_index,
+                dev_mode: candidate_mode,
+            });
+        }
+
+        mode_index = mode_index
+            .checked_add(1)
+            .ok_or_else(|| "GDI display mode index overflowed".to_string())?;
+    }
+
+    Ok(matching_candidates)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn gdi_mode_matches_refresh_only_request(
+    current_mode: &DEVMODEW,
+    candidate_mode: &DEVMODEW,
+    requested_refresh_rate: u32,
+) -> bool {
+    let required_fields =
+        DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
+
+    if !current_mode.dmFields.contains(required_fields)
+        || !candidate_mode.dmFields.contains(required_fields)
+    {
+        return false;
+    }
+
+    if candidate_mode.dmPelsWidth != current_mode.dmPelsWidth
+        || candidate_mode.dmPelsHeight != current_mode.dmPelsHeight
+        || candidate_mode.dmDisplayFrequency != requested_refresh_rate
+        || candidate_mode.dmBitsPerPel != current_mode.dmBitsPerPel
+        || candidate_mode.Anonymous2.dmDisplayFlags != current_mode.Anonymous2.dmDisplayFlags
+    {
+        return false;
+    }
+
+    if !optional_dev_mode_field_matches(
+        current_mode.dmFields.contains(DM_DISPLAYORIENTATION),
+        candidate_mode.dmFields.contains(DM_DISPLAYORIENTATION),
+        current_mode.Anonymous1.Anonymous2.dmDisplayOrientation.0,
+        candidate_mode.Anonymous1.Anonymous2.dmDisplayOrientation.0,
+    ) || !optional_dev_mode_field_matches(
+        current_mode.dmFields.contains(DM_DISPLAYFIXEDOUTPUT),
+        candidate_mode.dmFields.contains(DM_DISPLAYFIXEDOUTPUT),
+        current_mode.Anonymous1.Anonymous2.dmDisplayFixedOutput.0,
+        candidate_mode.Anonymous1.Anonymous2.dmDisplayFixedOutput.0,
+    ) {
+        return false;
+    }
+
+    let current_has_position = current_mode.dmFields.contains(DM_POSITION);
+    let candidate_has_position = candidate_mode.dmFields.contains(DM_POSITION);
+
+    optional_dev_mode_field_matches(
+        current_has_position,
+        candidate_has_position,
+        current_mode.Anonymous1.Anonymous2.dmPosition.x,
+        candidate_mode.Anonymous1.Anonymous2.dmPosition.x,
+    ) && optional_dev_mode_field_matches(
+        current_has_position,
+        candidate_has_position,
+        current_mode.Anonymous1.Anonymous2.dmPosition.y,
+        candidate_mode.Anonymous1.Anonymous2.dmPosition.y,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn optional_dev_mode_field_matches<T: Eq>(
+    current_is_valid: bool,
+    candidate_is_valid: bool,
+    current_value: T,
+    candidate_value: T,
+) -> bool {
+    !candidate_is_valid || (current_is_valid && current_value == candidate_value)
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_self_contained_native_dev_mode(
+    dev_mode: &DEVMODEW,
+    description: &str,
+) -> Result<(), String> {
+    if dev_mode.dmDriverExtra == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "The {description} reported {} bytes of driver-private DEVMODE data that were not captured; preflight was not attempted",
+            dev_mode.dmDriverExtra,
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn summarize_native_gdi_candidates(
+    candidates: &[NativeGdiCandidate],
+) -> Result<Vec<GdiEnumeratedCandidate>, String> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            Ok(GdiEnumeratedCandidate {
+                enumeration_index: candidate.enumeration_index,
+                mode: display_mode_from_dev_mode(&candidate.dev_mode)?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn classify_candidate_display_change_result(result: DISP_CHANGE) -> GdiCandidatePreflightStatus {
+    if result == DISP_CHANGE_SUCCESSFUL {
+        GdiCandidatePreflightStatus::Accepted
+    } else if result == DISP_CHANGE_BADMODE || result == DISP_CHANGE_FAILED {
+        GdiCandidatePreflightStatus::Rejected
+    } else {
+        GdiCandidatePreflightStatus::UnavailableOrError
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn display_change_result_name(result: DISP_CHANGE) -> &'static str {
+    if result == DISP_CHANGE_SUCCESSFUL {
+        "DISP_CHANGE_SUCCESSFUL"
+    } else if result == DISP_CHANGE_BADDUALVIEW {
+        "DISP_CHANGE_BADDUALVIEW"
+    } else if result == DISP_CHANGE_BADFLAGS {
+        "DISP_CHANGE_BADFLAGS"
+    } else if result == DISP_CHANGE_BADMODE {
+        "DISP_CHANGE_BADMODE"
+    } else if result == DISP_CHANGE_BADPARAM {
+        "DISP_CHANGE_BADPARAM"
+    } else if result == DISP_CHANGE_FAILED {
+        "DISP_CHANGE_FAILED"
+    } else if result == DISP_CHANGE_NOTUPDATED {
+        "DISP_CHANGE_NOTUPDATED"
+    } else if result == DISP_CHANGE_RESTART {
+        "DISP_CHANGE_RESTART"
+    } else {
+        "UNKNOWN_DISP_CHANGE_RESULT"
     }
 }
 
@@ -726,9 +1156,10 @@ unsafe fn get_primary_display_device_name() -> Result<[u16; 32], String> {
     let mut device_index = 0;
 
     loop {
-        let mut display_device = DISPLAY_DEVICEW::default();
-        display_device.cb =
-            std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        let mut display_device = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
 
         let result = EnumDisplayDevicesW(
             None,
@@ -754,13 +1185,64 @@ unsafe fn get_primary_display_device_name() -> Result<[u16; 32], String> {
     Err("Failed to find the primary display device".to_string())
 }
 
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_only_candidate_specific_driver_rejections_as_rejected() {
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_SUCCESSFUL),
+            GdiCandidatePreflightStatus::Accepted,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_BADMODE),
+            GdiCandidatePreflightStatus::Rejected,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_FAILED),
+            GdiCandidatePreflightStatus::Rejected,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_BADPARAM),
+            GdiCandidatePreflightStatus::UnavailableOrError,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_BADDUALVIEW),
+            GdiCandidatePreflightStatus::UnavailableOrError,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_BADFLAGS),
+            GdiCandidatePreflightStatus::UnavailableOrError,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_NOTUPDATED),
+            GdiCandidatePreflightStatus::UnavailableOrError,
+        );
+        assert_eq!(
+            classify_candidate_display_change_result(DISP_CHANGE_RESTART),
+            GdiCandidatePreflightStatus::UnavailableOrError,
+        );
+    }
+
+    #[test]
+    fn optional_candidate_fields_must_not_request_a_different_current_value() {
+        assert!(optional_dev_mode_field_matches(true, true, 1, 1));
+        assert!(optional_dev_mode_field_matches(false, false, 1, 2));
+        assert!(!optional_dev_mode_field_matches(true, true, 1, 2));
+        assert!(optional_dev_mode_field_matches(true, false, 1, 2));
+        assert!(!optional_dev_mode_field_matches(false, true, 1, 1));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_battery_status,
             get_display_info,
-            validate_current_ccd_configuration
+            validate_current_ccd_configuration,
+            preflight_gdi_refresh_rate_candidate
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
