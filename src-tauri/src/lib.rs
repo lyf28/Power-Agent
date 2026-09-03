@@ -4,6 +4,22 @@ use serde::Serialize;
 use windows::core::PCWSTR;
 
 #[cfg(target_os = "windows")]
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE,
+    DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+    DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE,
+    QDC_VIRTUAL_REFRESH_RATE_AWARE, QUERY_DISPLAY_CONFIG_FLAGS,
+};
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, LUID,
+};
+
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Power::{
     GetSystemPowerStatus,
     SYSTEM_POWER_STATUS,
@@ -11,21 +27,13 @@ use windows::Win32::System::Power::{
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW,
-    EnumDisplaySettingsExW,
-    DISPLAY_DEVICEW,
-    DISPLAY_DEVICE_PRIMARY_DEVICE,
-    DEVMODEW,
-    DM_BITSPERPEL,
-    DM_DISPLAYFIXEDOUTPUT,
-    DM_DISPLAYFLAGS,
-    DM_DISPLAYFREQUENCY,
-    DM_DISPLAYORIENTATION,
-    DM_PELSHEIGHT,
-    DM_PELSWIDTH,
-    ENUM_DISPLAY_SETTINGS_FLAGS,
-    ENUM_DISPLAY_SETTINGS_MODE,
-    ENUM_CURRENT_SETTINGS,
+    EnumDisplayDevicesW, EnumDisplaySettingsExW, DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE,
+    DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID, DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID,
+    DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID,
+    DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE, DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID,
+    DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE, DM_BITSPERPEL, DM_DISPLAYFIXEDOUTPUT,
+    DM_DISPLAYFLAGS, DM_DISPLAYFREQUENCY, DM_DISPLAYORIENTATION, DM_PELSHEIGHT, DM_PELSWIDTH,
+    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
 #[derive(Serialize)]
@@ -49,10 +57,101 @@ struct DisplayMode {
 }
 
 #[derive(Serialize)]
+struct AdapterLuid {
+    low_part: u32,
+    high_part: i32,
+}
+
+#[derive(Serialize)]
+struct RefreshRateRational {
+    numerator: u32,
+    denominator: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CcdModeType {
+    Source,
+    Target,
+    DesktopImage,
+}
+
+#[derive(Serialize)]
+struct CcdModeReference {
+    mode_info_index: u32,
+    mode_type: CcdModeType,
+    adapter_luid: AdapterLuid,
+    id: u32,
+}
+
+#[derive(Serialize)]
+struct CcdActivePath {
+    source_adapter_luid: AdapterLuid,
+    target_adapter_luid: AdapterLuid,
+    source_id: u32,
+    target_id: u32,
+    source_name: String,
+    is_active: bool,
+    target_available: bool,
+    path_flags: u32,
+    source_status_flags: u32,
+    target_status_flags: u32,
+    supports_virtual_mode: bool,
+    clone_group_id: Option<u32>,
+    path_refresh_rate: RefreshRateRational,
+    target_mode_refresh_rate: Option<RefreshRateRational>,
+    source_mode: Option<CcdModeReference>,
+    target_mode: Option<CcdModeReference>,
+    desktop_image_mode: Option<CcdModeReference>,
+    output_technology: i32,
+    rotation: i32,
+    scaling: i32,
+    scan_line_ordering: i32,
+}
+
+#[derive(Serialize)]
+struct CcdDisplayMapping {
+    query_flags: Option<u32>,
+    active_paths: Vec<CcdActivePath>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
 struct DisplayInfo {
     display_device_name: String,
     current_mode: DisplayMode,
     driver_reported_mode_candidates: Vec<DisplayMode>,
+    ccd_mapping: CcdDisplayMapping,
+}
+
+#[cfg(target_os = "windows")]
+struct CcdSnapshot {
+    query_flags: QUERY_DISPLAY_CONFIG_FLAGS,
+    paths: Vec<DISPLAYCONFIG_PATH_INFO>,
+    modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+}
+
+#[cfg(target_os = "windows")]
+enum CcdQueryError {
+    WindowsApi { operation: &'static str, code: u32 },
+    RetryLimit,
+    InvalidData(String),
+}
+
+#[cfg(target_os = "windows")]
+impl std::fmt::Display for CcdQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowsApi { operation, code } => {
+                write!(formatter, "{operation} failed with Windows error {code}")
+            }
+            Self::RetryLimit => write!(
+                formatter,
+                "Display configuration kept changing while it was queried"
+            ),
+            Self::InvalidData(message) => formatter.write_str(message),
+        }
+    }
 }
 
 #[tauri::command]
@@ -155,11 +254,317 @@ fn get_display_info() -> Result<DisplayInfo, String> {
             );
         }
 
+        let ccd_mapping = get_ccd_display_mapping(&display_device_name).unwrap_or_else(|error| {
+            CcdDisplayMapping {
+                query_flags: None,
+                active_paths: Vec::new(),
+                error: Some(error),
+            }
+        });
+
         Ok(DisplayInfo {
             display_device_name,
             current_mode,
             driver_reported_mode_candidates,
+            ccd_mapping,
         })
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn get_ccd_display_mapping(
+    primary_gdi_device_name: &str,
+) -> Result<CcdDisplayMapping, String> {
+    let snapshot = query_active_ccd_snapshot().map_err(|error| error.to_string())?;
+    let mut active_paths = Vec::new();
+
+    for path in &snapshot.paths {
+        let source_name = get_ccd_source_name(path).map_err(|error| error.to_string())?;
+
+        if source_name.eq_ignore_ascii_case(primary_gdi_device_name) {
+            active_paths.push(
+                ccd_active_path_from_snapshot(path, &source_name, &snapshot.modes)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+
+    if active_paths.is_empty() {
+        return Err(format!(
+            "No active CCD path matched primary GDI display {primary_gdi_device_name}"
+        ));
+    }
+
+    Ok(CcdDisplayMapping {
+        query_flags: Some(snapshot.query_flags.0),
+        active_paths,
+        error: None,
+    })
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn query_active_ccd_snapshot() -> Result<CcdSnapshot, CcdQueryError> {
+    let query_flag_options = [
+        QUERY_DISPLAY_CONFIG_FLAGS(
+            QDC_ONLY_ACTIVE_PATHS.0 | QDC_VIRTUAL_MODE_AWARE.0 | QDC_VIRTUAL_REFRESH_RATE_AWARE.0,
+        ),
+        QUERY_DISPLAY_CONFIG_FLAGS(QDC_ONLY_ACTIVE_PATHS.0 | QDC_VIRTUAL_MODE_AWARE.0),
+        QDC_ONLY_ACTIVE_PATHS,
+    ];
+
+    let mut last_error = None;
+
+    for query_flags in query_flag_options {
+        match query_ccd_snapshot_with_flags(query_flags) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error @ CcdQueryError::WindowsApi { code, .. })
+                if code == ERROR_INVALID_PARAMETER.0 =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        CcdQueryError::InvalidData(
+            "No compatible CCD query flag combination was available".to_string(),
+        )
+    }))
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn query_ccd_snapshot_with_flags(
+    query_flags: QUERY_DISPLAY_CONFIG_FLAGS,
+) -> Result<CcdSnapshot, CcdQueryError> {
+    const MAX_QUERY_ATTEMPTS: usize = 5;
+
+    for _ in 0..MAX_QUERY_ATTEMPTS {
+        let mut path_count = 0;
+        let mut mode_count = 0;
+        let result = GetDisplayConfigBufferSizes(query_flags, &mut path_count, &mut mode_count);
+
+        if result != ERROR_SUCCESS {
+            return Err(CcdQueryError::WindowsApi {
+                operation: "GetDisplayConfigBufferSizes",
+                code: result.0,
+            });
+        }
+
+        if path_count == 0 || mode_count == 0 {
+            return Err(CcdQueryError::InvalidData(
+                "Windows returned an empty active display configuration".to_string(),
+            ));
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+
+        let result = QueryDisplayConfig(
+            query_flags,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        );
+
+        if result == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+
+        if result != ERROR_SUCCESS {
+            return Err(CcdQueryError::WindowsApi {
+                operation: "QueryDisplayConfig",
+                code: result.0,
+            });
+        }
+
+        paths.truncate(path_count as usize);
+        modes.truncate(mode_count as usize);
+
+        return Ok(CcdSnapshot {
+            query_flags,
+            paths,
+            modes,
+        });
+    }
+
+    Err(CcdQueryError::RetryLimit)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn get_ccd_source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, CcdQueryError> {
+    let mut source_name = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+            adapterId: path.sourceInfo.adapterId,
+            id: path.sourceInfo.id,
+        },
+        ..Default::default()
+    };
+
+    let result = DisplayConfigGetDeviceInfo(&mut source_name.header);
+
+    if result != ERROR_SUCCESS.0 as i32 {
+        return Err(CcdQueryError::WindowsApi {
+            operation: "DisplayConfigGetDeviceInfo(GET_SOURCE_NAME)",
+            code: result as u32,
+        });
+    }
+
+    Ok(null_terminated_utf16_to_string(
+        &source_name.viewGdiDeviceName,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn ccd_active_path_from_snapshot(
+    path: &DISPLAYCONFIG_PATH_INFO,
+    source_name: &str,
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+) -> Result<CcdActivePath, CcdQueryError> {
+    let supports_virtual_mode = path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0;
+    let raw_source_mode_info = path.sourceInfo.Anonymous.modeInfoIdx;
+    let raw_target_mode_info = path.targetInfo.Anonymous.modeInfoIdx;
+
+    let (source_mode_index, target_mode_index, desktop_image_mode_index, clone_group_id) =
+        if supports_virtual_mode {
+            let clone_group_id = raw_source_mode_info & 0xffff;
+            let source_mode_index = (raw_source_mode_info >> 16) & 0xffff;
+            let desktop_image_mode_index = raw_target_mode_info & 0xffff;
+            let target_mode_index = (raw_target_mode_info >> 16) & 0xffff;
+
+            (
+                valid_mode_index(
+                    source_mode_index,
+                    DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID,
+                ),
+                valid_mode_index(
+                    target_mode_index,
+                    DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID,
+                ),
+                valid_mode_index(
+                    desktop_image_mode_index,
+                    DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID,
+                ),
+                valid_mode_index(clone_group_id, DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID),
+            )
+        } else {
+            (
+                valid_mode_index(raw_source_mode_info, DISPLAYCONFIG_PATH_MODE_IDX_INVALID),
+                valid_mode_index(raw_target_mode_info, DISPLAYCONFIG_PATH_MODE_IDX_INVALID),
+                None,
+                None,
+            )
+        };
+
+    let source_mode = mode_reference(
+        modes,
+        source_mode_index,
+        DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+        CcdModeType::Source,
+    )?;
+    let target_mode = mode_reference(
+        modes,
+        target_mode_index,
+        DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+        CcdModeType::Target,
+    )?;
+    let desktop_image_mode = mode_reference(
+        modes,
+        desktop_image_mode_index,
+        DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE,
+        CcdModeType::DesktopImage,
+    )?;
+    let target_mode_refresh_rate = target_mode_index
+        .and_then(|index| modes.get(index as usize))
+        .map(|mode_info| {
+            refresh_rate_rational(
+                mode_info
+                    .Anonymous
+                    .targetMode
+                    .targetVideoSignalInfo
+                    .vSyncFreq,
+            )
+        });
+
+    Ok(CcdActivePath {
+        source_adapter_luid: adapter_luid(path.sourceInfo.adapterId),
+        target_adapter_luid: adapter_luid(path.targetInfo.adapterId),
+        source_id: path.sourceInfo.id,
+        target_id: path.targetInfo.id,
+        source_name: source_name.to_string(),
+        is_active: path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0,
+        target_available: path.targetInfo.targetAvailable.as_bool(),
+        path_flags: path.flags,
+        source_status_flags: path.sourceInfo.statusFlags,
+        target_status_flags: path.targetInfo.statusFlags,
+        supports_virtual_mode,
+        clone_group_id,
+        path_refresh_rate: refresh_rate_rational(path.targetInfo.refreshRate),
+        target_mode_refresh_rate,
+        source_mode,
+        target_mode,
+        desktop_image_mode,
+        output_technology: path.targetInfo.outputTechnology.0,
+        rotation: path.targetInfo.rotation.0,
+        scaling: path.targetInfo.scaling.0,
+        scan_line_ordering: path.targetInfo.scanLineOrdering.0,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn valid_mode_index(index: u32, invalid_value: u32) -> Option<u32> {
+    (index != invalid_value).then_some(index)
+}
+
+#[cfg(target_os = "windows")]
+fn mode_reference(
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+    mode_info_index: Option<u32>,
+    expected_type: DISPLAYCONFIG_MODE_INFO_TYPE,
+    mode_type: CcdModeType,
+) -> Result<Option<CcdModeReference>, CcdQueryError> {
+    let Some(mode_info_index) = mode_info_index else {
+        return Ok(None);
+    };
+
+    let mode_info = modes.get(mode_info_index as usize).ok_or_else(|| {
+        CcdQueryError::InvalidData(format!(
+            "CCD mode index {mode_info_index} was outside the returned mode table"
+        ))
+    })?;
+
+    if mode_info.infoType != expected_type {
+        return Err(CcdQueryError::InvalidData(format!(
+            "CCD mode index {mode_info_index} had unexpected mode type {}",
+            mode_info.infoType.0,
+        )));
+    }
+
+    Ok(Some(CcdModeReference {
+        mode_info_index,
+        mode_type,
+        adapter_luid: adapter_luid(mode_info.adapterId),
+        id: mode_info.id,
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn adapter_luid(value: LUID) -> AdapterLuid {
+    AdapterLuid {
+        low_part: value.LowPart,
+        high_part: value.HighPart,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_rate_rational(value: DISPLAYCONFIG_RATIONAL) -> RefreshRateRational {
+    RefreshRateRational {
+        numerator: value.Numerator,
+        denominator: value.Denominator,
     }
 }
 

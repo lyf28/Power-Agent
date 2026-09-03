@@ -112,6 +112,22 @@ Each driver-reported candidate currently preserves:
 
 Only candidates matching the current resolution are retained. These candidates are GDI display modes reported by Windows and the display driver. They are not necessarily exposed by Windows Settings, validated as controllable by Power Agent, or approved as Available Legal Actions.
 
+The current implementation also queries the active Windows Connecting and Configuring Displays (CCD) configuration as a read-only identity and topology mapping foundation. The primary GDI source name is matched to CCD source information returned by `DisplayConfigGetDeviceInfo`, producing the active path identity needed by future validation:
+
+```text
+Primary GDI Display Name (for example, \\.\DISPLAY1)
+        ↓ exact source-name mapping
+CCD Adapter LUID + Source ID
+        ↓ current active path
+CCD Target ID + Current Path/Mode References
+```
+
+The mapping does not use the numeric suffix of `DISPLAYx` or assume that GDI and CCD enumeration indexes correspond. A source may map to more than one active path in a clone topology, so the backend represents matched paths as a collection.
+
+CCD path refresh information is preserved as numerator/denominator rational values. The path refresh rate and target-mode vertical sync rate are represented separately because virtual or dynamic refresh-rate configurations can give them different meanings.
+
+This CCD snapshot describes the current active configuration only. It does not prove that any driver-reported candidate can be applied, and it does not promote a candidate to a Controllable Action or an Available Legal Action.
+
 Next step:
 
 * Validate candidates with the intended execution API without applying them
@@ -312,6 +328,8 @@ Observe Current State
         ↓
 Enumerate Driver-Reported Candidates
         ↓
+Map Current GDI Source to Active CCD Path
+        ↓
 Validate Candidate With Intended Execution API
         ↓
 Derive Controllable Actions
@@ -390,7 +408,24 @@ Windows Display APIs may currently or eventually support:
 * Validate whether a candidate is controllable
 * Change refresh rate after policy approval
 
-The current implementation only reads current state and enumerates driver-reported candidates. It does not implement controllability validation, `SetDisplayConfig`, or any refresh-rate modification.
+The current implementation reads current state, enumerates driver-reported candidates, and builds a read-only GDI-to-CCD active-path mapping. It does not implement controllability validation, `SetDisplayConfig`, or any refresh-rate modification.
+
+Display capability discovery currently uses two related but distinct Windows API views:
+
+* GDI APIs identify the primary display view, read its current `DEVMODE`, and enumerate driver-reported mode candidates for the current resolution.
+* CCD APIs query the current active configuration and map the GDI view name to adapter, source, target, path, and mode-table identity.
+
+Conceptually:
+
+```text
+GDI Current Mode / Driver-Reported Candidates
+        +
+GDI Display Name → CCD Source → Active CCD Path / Target
+        ↓
+Identity foundation for future candidate validation
+```
+
+The CCD query is read-only and is supplementary to existing GDI telemetry. A CCD query or mapping failure is reported without turning the existing GDI current-mode and candidate data into a failure. Mode-table indexes are snapshot-local and must not be treated as persistent identities across later CCD queries.
 
 ### 9.3 Future BEM / Component Capabilities
 
@@ -536,6 +571,8 @@ Current Refresh Rate              Implemented / Validating
 Driver-Reported Refresh Rate
 Candidates                        Implemented
 
+GDI-to-CCD Active Path Mapping    Implemented
+
 Controllable Action Validation    Not Started
 
 Available Legal Action Derivation Not Started
@@ -573,6 +610,8 @@ The current development sequence is:
 Observe
    ↓
 Enumerate Driver-Reported Candidates
+   ↓
+Map Current GDI Source to Active CCD Path
    ↓
 Validate Candidates
    ↓
