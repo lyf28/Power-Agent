@@ -179,17 +179,17 @@ unsafe fn display_mode_from_dev_mode(
         );
     }
 
-    let display_properties = dev_mode.Anonymous1.Anonymous2;
+    let orientation = if dev_mode.dmFields.contains(DM_DISPLAYORIENTATION) {
+        Some(dev_mode.Anonymous1.Anonymous2.dmDisplayOrientation.0)
+    } else {
+        None
+    };
 
-    let orientation = dev_mode
-        .dmFields
-        .contains(DM_DISPLAYORIENTATION)
-        .then_some(display_properties.dmDisplayOrientation.0);
-
-    let fixed_output = dev_mode
-        .dmFields
-        .contains(DM_DISPLAYFIXEDOUTPUT)
-        .then_some(display_properties.dmDisplayFixedOutput.0);
+    let fixed_output = if dev_mode.dmFields.contains(DM_DISPLAYFIXEDOUTPUT) {
+        Some(dev_mode.Anonymous1.Anonymous2.dmDisplayFixedOutput.0)
+    } else {
+        None
+    };
 
     Ok(DisplayMode {
         width: dev_mode.dmPelsWidth,
