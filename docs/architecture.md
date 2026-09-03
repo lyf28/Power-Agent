@@ -93,15 +93,30 @@ In the future, remaining battery time may be estimated based on telemetry histor
 
 ### 3.2 Display Telemetry
 
-Windows Display APIs are currently being introduced to retrieve:
+Windows Display APIs currently retrieve the following information for the primary display:
 
 * Current refresh rate
+* Current display mode
+* Driver-reported display mode candidates
 
-The initial implementation primarily targets the primary display.
+Each driver-reported candidate currently preserves:
+
+* Width
+* Height
+* Refresh rate
+* Bits per pixel
+* Display flags
+* Display orientation, when reported
+* Fixed-output behavior, when reported
+* `DEVMODE` field-validity flags
+
+Only candidates matching the current resolution are retained. These candidates are GDI display modes reported by Windows and the display driver. They are not necessarily exposed by Windows Settings, validated as controllable by Power Agent, or approved as Available Legal Actions.
 
 Next step:
 
-* Enumerate supported refresh rates under the current display configuration
+* Validate candidates with the intended execution API without applying them
+* Derive Controllable Refresh-Rate Actions
+* Apply Policy / Safety constraints before exposing Available Legal Actions
 
 ### 3.3 Future Telemetry
 
@@ -226,7 +241,11 @@ Battery = 25%
 
 Current Refresh Rate = 120 Hz
 
-Supported Refresh Rates = [60, 120]
+Driver-Reported Refresh Rate Candidates = [60, 120]
+
+Validated Controllable Refresh Rates = [60, 120]
+
+Available Legal Actions = [KEEP_120HZ, CHANGE_TO_60HZ]
 
 Context = Meeting
 
@@ -251,7 +270,7 @@ It must first pass through the Policy / Safety Layer.
 
 Power Agent should not allow the LLM to freely generate arbitrary system actions.
 
-The Capability Layer should first provide the actions that are actually supported by the current system.
+Driver-reported display modes are capability-discovery candidates. They must not be treated directly as Controllable Actions or Available Legal Actions.
 
 For example:
 
@@ -259,14 +278,23 @@ For example:
 Current Refresh Rate:
 120 Hz
 
-Supported Refresh Rates:
+Driver-Reported Refresh Rate Candidates:
 60 Hz
 120 Hz
 ```
 
-The legal actions may therefore include:
+This information alone is not sufficient to produce `CHANGE_TO_60HZ`. The candidate must first be validated with the intended execution API under the current display configuration. A successful validation may produce:
 
 ```text
+Controllable Refresh-Rate Actions:
+KEEP_120HZ
+CHANGE_TO_60HZ
+```
+
+After Policy / Safety constraints are applied, the resulting legal actions may include:
+
+```text
+Available Legal Actions:
 KEEP_120HZ
 CHANGE_TO_60HZ
 ```
@@ -282,10 +310,20 @@ Therefore, an important execution flow is:
 ```text
 Observe Current State
         ↓
-Discover Available Actions
+Enumerate Driver-Reported Candidates
+        ↓
+Validate Candidate With Intended Execution API
+        ↓
+Derive Controllable Actions
+        ↓
+Apply Policy / Safety Constraints
+        ↓
+Expose Available Legal Actions
         ↓
 Decision
 ```
+
+The Policy / Safety step shown here is pre-decision action-admissibility filtering. After the Decision Engine selects a candidate action, the selected action must still pass the final Policy / Safety check before execution.
 
 This is a key design principle of the current MVP.
 
@@ -348,8 +386,11 @@ Currently uses:
 Windows Display APIs may currently or eventually support:
 
 * Read current refresh rate
-* Enumerate supported refresh rates
-* Change refresh rate
+* Enumerate driver-reported display mode candidates
+* Validate whether a candidate is controllable
+* Change refresh rate after policy approval
+
+The current implementation only reads current state and enumerates driver-reported candidates. It does not implement controllability validation, `SetDisplayConfig`, or any refresh-rate modification.
 
 ### 9.3 Future BEM / Component Capabilities
 
@@ -492,7 +533,12 @@ Charging State                    Done
 
 Current Refresh Rate              Implemented / Validating
 
-Supported Refresh Rates           Current Task
+Driver-Reported Refresh Rate
+Candidates                        Implemented
+
+Controllable Action Validation    Not Started
+
+Available Legal Action Derivation Not Started
 
 Natural Language Input            Not Started
 
@@ -511,7 +557,9 @@ History / Personalization         Not Started
 
 Battery telemetry currently uses the Windows `GetSystemPowerStatus()` API.
 
-Display telemetry has started using Windows Display APIs to retrieve the current refresh rate.
+Display telemetry retrieves the current refresh rate and preserves the necessary metadata for driver-reported display mode candidates at the current resolution.
+
+These candidates have not passed controllability validation and have not been converted into Available Legal Actions.
 
 The actual repository implementation remains the source of truth for current development status.
 
@@ -524,7 +572,15 @@ The current development sequence is:
 ```text
 Observe
    ↓
-Discover Available Actions
+Enumerate Driver-Reported Candidates
+   ↓
+Validate Candidates
+   ↓
+Derive Controllable Actions
+   ↓
+Apply Policy Constraints
+   ↓
+Expose Available Legal Actions
    ↓
 Add Context / Intent
    ↓
