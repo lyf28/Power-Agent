@@ -142,6 +142,10 @@ This operation does not include `SDC_APPLY`, `SDC_ALLOW_CHANGES`, or database-sa
 
 Current CCD Configuration Validation is an infrastructure sanity check. Success does not validate any driver-reported refresh-rate candidate and does not derive a Controllable Action or Available Legal Action.
 
+Candidate-validation research found an important boundary between the GDI and CCD representations. A GDI `DEVMODE` candidate contains the logical display-mode fields reported by `EnumDisplaySettingsExW`, including an integer `dmDisplayFrequency`, but it does not contain the complete CCD target signal timing. A `DISPLAYCONFIG_TARGET_MODE` additionally requires values such as pixel rate, rational horizontal and vertical sync frequencies, active size, total size, and scan-line ordering. These missing values must not be guessed or derived from assumed blanking intervals.
+
+The public CCD APIs used here do not expose the complete timing for every arbitrary non-current GDI candidate. `QueryDisplayConfig` returns the current configuration, while `DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE)` returns the preferred target mode rather than all alternate target timings. Therefore, the current 40 Hz and 48 Hz entries remain driver-reported candidates; neither has an exact CCD target-mode identity yet.
+
 Next step:
 
 * Validate candidates with the intended execution API without applying them
@@ -443,6 +447,35 @@ The CCD query is read-only and is supplementary to existing GDI telemetry. A CCD
 
 Current configuration validation always performs a new `QueryDisplayConfig` call and passes the complete native active path and mode arrays from that same snapshot to `SetDisplayConfig`. It preserves path priority and the full multi-display topology; it does not validate only the primary display path. Query awareness flags are paired with the corresponding `SDC_VIRTUAL_MODE_AWARE` and `SDC_VIRTUAL_REFRESH_RATE_AWARE` modifiers when applicable.
 
+#### Candidate-validation evidence levels
+
+Candidate validation must preserve the distinction between the following evidence levels:
+
+1. **Driver-reported candidate:** `EnumDisplaySettingsExW` reports a `DEVMODE` for the current resolution. This is discovery evidence only.
+2. **GDI driver preflight:** `ChangeDisplaySettingsExW` with `CDS_TEST` can test the exact enumerated `DEVMODE` without applying it. Success is evidence that the GDI/driver path accepts that graphics mode, but it does not prove compatibility with the complete current CCD topology or identify an exact CCD target timing.
+3. **OS-resolved CCD request validation:** `SetDisplayConfig` permits a target mode to be omitted and can use best-mode logic to supply missing mode information. A validation-only request may therefore test a nominal path refresh-rate request without constructing target timing. Success means Windows found a compatible configuration for that request; it does not prove that the resolved mode is a particular GDI candidate or a caller-known exact target mode.
+4. **Exact execution validation:** A candidate is exact only when the intended execution mechanism supplies or identifies the complete requested mode without guessed timing, and validates that same execution representation against a fresh full-topology snapshot.
+
+`SDC_ALLOW_CHANGES` must not be used to claim exact candidate controllability. That flag permits Windows to modify supplied source and target mode information to create a functional path set, so success provides weaker evidence than validation of the unchanged request.
+
+There is no documented public API contract exposing the exact refresh-rate option model used by the Windows Settings dropdown together with complete non-current CCD target timings. Settings visibility can be supporting UX evidence, but it is not itself a machine-readable validation result. For example, a driver-reported 48 Hz candidate that is absent from Settings must remain a candidate rather than being silently removed or promoted.
+
+The recommended validation pipeline is:
+
+```text
+Driver-Reported GDI Candidate
+        -> GDI CDS_TEST Preflight
+        -> Fresh Full CCD Topology Snapshot
+        -> Validation With the Intended Execution Contract
+             - OS-resolved nominal refresh request, or
+             - execution-specific exact mode identity/timing
+        -> Controllable Action With an Explicit Guarantee Level
+        -> Policy / Safety
+        -> Available Legal Action
+```
+
+An OS-resolved action, if adopted later, must be represented according to its actual contract, for example `REQUEST_NOMINAL_40HZ_WITH_OS_MODE_RESOLUTION`. It must not be mislabeled as applying a known exact 40 Hz CCD target mode. Exact mode control may require an execution-specific or vendor/OEM API that can enumerate and validate the same mode representation it will later apply.
+
 The separation is:
 
 ```text
@@ -610,7 +643,11 @@ GDI-to-CCD Active Path Mapping    Implemented
 Current CCD Configuration
 Validation                        Implemented
 
-Candidate Validation              Not Started
+Candidate Validation Research     Complete
+
+GDI Candidate Preflight           Not Started
+
+Exact CCD Candidate Validation    Not Implemented; public API timing gap
 
 Controllable Action Derivation    Not Started
 
