@@ -5,18 +5,20 @@ use windows::core::PCWSTR;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE,
     DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE,
-    QDC_VIRTUAL_REFRESH_RATE_AWARE, QUERY_DISPLAY_CONFIG_FLAGS,
+    QDC_VIRTUAL_REFRESH_RATE_AWARE, QUERY_DISPLAY_CONFIG_FLAGS, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_VALIDATE, SDC_VIRTUAL_MODE_AWARE, SDC_VIRTUAL_REFRESH_RATE_AWARE, SET_DISPLAY_CONFIG_FLAGS,
 };
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, LUID,
+    ERROR_BAD_CONFIGURATION, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_SUCCESS,
+    LUID,
 };
 
 #[cfg(target_os = "windows")]
@@ -117,6 +119,25 @@ struct CcdDisplayMapping {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CurrentCcdConfigurationValidationStatus {
+    Valid,
+    Invalid,
+    UnavailableOrError,
+}
+
+#[derive(Serialize)]
+struct CurrentCcdConfigurationValidation {
+    status: CurrentCcdConfigurationValidationStatus,
+    windows_result_code: Option<u32>,
+    query_flags: Option<u32>,
+    validation_flags: Option<u32>,
+    path_count: u32,
+    mode_count: u32,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
 struct DisplayInfo {
     display_device_name: String,
     current_mode: DisplayMode,
@@ -154,6 +175,17 @@ impl std::fmt::Display for CcdQueryError {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl CcdQueryError {
+    fn windows_result_code(&self) -> Option<u32> {
+        match self {
+            Self::WindowsApi { code, .. } => Some(*code),
+            Self::RetryLimit => Some(ERROR_INSUFFICIENT_BUFFER.0),
+            Self::InvalidData(_) => None,
+        }
+    }
+}
+
 #[tauri::command]
 fn get_battery_status() -> Result<BatteryStatus, String> {
     unsafe {
@@ -181,6 +213,61 @@ fn get_battery_status() -> Result<BatteryStatus, String> {
             charging,
             remaining_seconds,
         })
+    }
+}
+
+#[tauri::command]
+fn validate_current_ccd_configuration() -> CurrentCcdConfigurationValidation {
+    unsafe {
+        let snapshot = match query_active_ccd_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return CurrentCcdConfigurationValidation {
+                    status: CurrentCcdConfigurationValidationStatus::UnavailableOrError,
+                    windows_result_code: error.windows_result_code(),
+                    query_flags: None,
+                    validation_flags: None,
+                    path_count: 0,
+                    mode_count: 0,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        let validation_flags = current_ccd_validation_flags(snapshot.query_flags);
+        let path_count = snapshot.paths.len() as u32;
+        let mode_count = snapshot.modes.len() as u32;
+        let windows_result = SetDisplayConfig(
+            Some(&snapshot.paths),
+            Some(&snapshot.modes),
+            validation_flags,
+        );
+        let windows_result_code = windows_result as u32;
+
+        let (status, error) = if windows_result == ERROR_SUCCESS.0 as i32 {
+            (CurrentCcdConfigurationValidationStatus::Valid, None)
+        } else if windows_result == ERROR_BAD_CONFIGURATION.0 as i32 {
+            (
+                CurrentCcdConfigurationValidationStatus::Invalid,
+                Some("Windows rejected the supplied current CCD configuration".to_string()),
+            )
+        } else {
+            (
+                CurrentCcdConfigurationValidationStatus::UnavailableOrError,
+                Some(format!(
+                    "SetDisplayConfig(SDC_VALIDATE) failed with Windows error {windows_result_code}"
+                )),
+            )
+        };
+
+        CurrentCcdConfigurationValidation {
+            status,
+            windows_result_code: Some(windows_result_code),
+            query_flags: Some(snapshot.query_flags.0),
+            validation_flags: Some(validation_flags.0),
+            path_count,
+            mode_count,
+            error,
+        }
     }
 }
 
@@ -331,6 +418,23 @@ unsafe fn query_active_ccd_snapshot() -> Result<CcdSnapshot, CcdQueryError> {
             "No compatible CCD query flag combination was available".to_string(),
         )
     }))
+}
+
+#[cfg(target_os = "windows")]
+fn current_ccd_validation_flags(
+    query_flags: QUERY_DISPLAY_CONFIG_FLAGS,
+) -> SET_DISPLAY_CONFIG_FLAGS {
+    let mut validation_flags = SDC_VALIDATE.0 | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0;
+
+    if query_flags.0 & QDC_VIRTUAL_MODE_AWARE.0 != 0 {
+        validation_flags |= SDC_VIRTUAL_MODE_AWARE.0;
+    }
+
+    if query_flags.0 & QDC_VIRTUAL_REFRESH_RATE_AWARE.0 != 0 {
+        validation_flags |= SDC_VIRTUAL_REFRESH_RATE_AWARE.0;
+    }
+
+    SET_DISPLAY_CONFIG_FLAGS(validation_flags)
 }
 
 #[cfg(target_os = "windows")]
@@ -655,7 +759,8 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_battery_status,
-            get_display_info
+            get_display_info,
+            validate_current_ccd_configuration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

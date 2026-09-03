@@ -128,6 +128,20 @@ CCD path refresh information is preserved as numerator/denominator rational valu
 
 This CCD snapshot describes the current active configuration only. It does not prove that any driver-reported candidate can be applied, and it does not promote a candidate to a Controllable Action or an Available Legal Action.
 
+The backend can also perform an explicit, validation-only sanity check of the latest complete active CCD snapshot. It queries all active paths and their mode table again, then calls `SetDisplayConfig` with:
+
+```text
+SDC_VALIDATE
++
+SDC_USE_SUPPLIED_DISPLAY_CONFIG
++
+matching virtual-mode awareness flags
+```
+
+This operation does not include `SDC_APPLY`, `SDC_ALLOW_CHANGES`, or database-saving flags. It tests whether Power Agent can construct a coherent validation payload for the current configuration without applying a display change. Failure is reported separately and does not invalidate the existing GDI telemetry or CCD identity mapping.
+
+Current CCD Configuration Validation is an infrastructure sanity check. Success does not validate any driver-reported refresh-rate candidate and does not derive a Controllable Action or Available Legal Action.
+
 Next step:
 
 * Validate candidates with the intended execution API without applying them
@@ -408,7 +422,7 @@ Windows Display APIs may currently or eventually support:
 * Validate whether a candidate is controllable
 * Change refresh rate after policy approval
 
-The current implementation reads current state, enumerates driver-reported candidates, and builds a read-only GDI-to-CCD active-path mapping. It does not implement controllability validation, `SetDisplayConfig`, or any refresh-rate modification.
+The current implementation reads current state, enumerates driver-reported candidates, builds a read-only GDI-to-CCD active-path mapping, and can validate the latest unchanged active configuration with `SetDisplayConfig` in `SDC_VALIDATE` mode. It does not implement candidate controllability validation, `SDC_APPLY`, or any refresh-rate modification.
 
 Display capability discovery currently uses two related but distinct Windows API views:
 
@@ -426,6 +440,26 @@ Identity foundation for future candidate validation
 ```
 
 The CCD query is read-only and is supplementary to existing GDI telemetry. A CCD query or mapping failure is reported without turning the existing GDI current-mode and candidate data into a failure. Mode-table indexes are snapshot-local and must not be treated as persistent identities across later CCD queries.
+
+Current configuration validation always performs a new `QueryDisplayConfig` call and passes the complete native active path and mode arrays from that same snapshot to `SetDisplayConfig`. It preserves path priority and the full multi-display topology; it does not validate only the primary display path. Query awareness flags are paired with the corresponding `SDC_VIRTUAL_MODE_AWARE` and `SDC_VIRTUAL_REFRESH_RATE_AWARE` modifiers when applicable.
+
+The separation is:
+
+```text
+Current Active CCD Configuration
+        ↓ validation-only infrastructure sanity check
+Current CCD Configuration Validation
+
+Driver-Reported Candidate
+        ↓ not implemented yet
+Candidate Validation
+        ↓
+Controllable Action
+        ↓
+Policy / Safety
+        ↓
+Available Legal Action
+```
 
 ### 9.3 Future BEM / Component Capabilities
 
@@ -573,7 +607,12 @@ Candidates                        Implemented
 
 GDI-to-CCD Active Path Mapping    Implemented
 
-Controllable Action Validation    Not Started
+Current CCD Configuration
+Validation                        Implemented
+
+Candidate Validation              Not Started
+
+Controllable Action Derivation    Not Started
 
 Available Legal Action Derivation Not Started
 
@@ -596,7 +635,7 @@ Battery telemetry currently uses the Windows `GetSystemPowerStatus()` API.
 
 Display telemetry retrieves the current refresh rate and preserves the necessary metadata for driver-reported display mode candidates at the current resolution.
 
-These candidates have not passed controllability validation and have not been converted into Available Legal Actions.
+These candidates have not passed candidate validation, have not produced Controllable Actions, and have not been converted into Available Legal Actions.
 
 The actual repository implementation remains the source of truth for current development status.
 
@@ -612,6 +651,8 @@ Observe
 Enumerate Driver-Reported Candidates
    ↓
 Map Current GDI Source to Active CCD Path
+   ↓
+Validate Current CCD Configuration
    ↓
 Validate Candidates
    ↓
