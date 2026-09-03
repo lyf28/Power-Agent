@@ -9,8 +9,21 @@ interface BatteryStatus {
   remaining_seconds: number | null;
 }
 
-interface DisplayInfo {
+interface DisplayMode {
+  width: number;
+  height: number;
   refresh_rate: number;
+  bits_per_pixel: number;
+  display_flags: number;
+  orientation: number | null;
+  fixed_output: number | null;
+  field_flags: number;
+}
+
+interface DisplayInfo {
+  display_device_name: string;
+  current_mode: DisplayMode;
+  driver_reported_mode_candidates: DisplayMode[];
 }
 
 function formatRemainingTime(seconds: number | null) {
@@ -28,6 +41,7 @@ function App() {
   const [battery, setBattery] = useState<BatteryStatus | null>(null);
   const [display, setDisplay] = useState<DisplayInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [displayError, setDisplayError] = useState<string | null>(null);
 
   async function loadBatteryStatus() {
     try {
@@ -44,20 +58,19 @@ function App() {
   }
 
   async function loadDisplayInfo() {
-  try {
-    const result =
-      await invoke<DisplayInfo>("get_display_info");
+    try {
+      const result = await invoke<DisplayInfo>("get_display_info");
 
-    console.log("Display info:", result);
+      console.log("Display info:", result);
 
-    setDisplay(result);
-  } catch (err) {
-    console.error(
-      "Failed to get display info:",
-      err
-    );
+      setDisplay(result);
+      setDisplayError(null);
+    } catch (err) {
+      console.error("Failed to get display info:", err);
+      setDisplay(null);
+      setDisplayError(String(err));
+    }
   }
-}
 
   useEffect(() => {
     loadBatteryStatus();
@@ -72,6 +85,16 @@ function App() {
       clearInterval(interval);
     };
   }, []);
+
+  const driverReportedRefreshRates = display
+    ? [
+        ...new Set(
+          display.driver_reported_mode_candidates.map(
+            (candidate) => candidate.refresh_rate,
+          ),
+        ),
+      ].sort((first, second) => first - second)
+    : [];
 
   return (
     <main>
@@ -102,10 +125,20 @@ function App() {
         </div>
       )}
 
+      {displayError && <p>Display Error: {displayError}</p>}
+
       {display && (
-        <p>
-          Refresh Rate: {display.refresh_rate} Hz
-        </p>
+        <div>
+          <p>Current Refresh Rate: {display.current_mode.refresh_rate} Hz</p>
+
+          <p>Driver-Reported Refresh Rate Candidates:</p>
+
+          <ul>
+            {driverReportedRefreshRates.map((refreshRate) => (
+              <li key={refreshRate}>{refreshRate} Hz</li>
+            ))}
+          </ul>
+        </div>
       )}
     </main>
   );
